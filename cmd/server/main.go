@@ -1,4 +1,3 @@
-// Package main запускает HTTP-сервер и слушает очереди RabbitMQ для задач экспорта.
 package main
 
 import (
@@ -7,150 +6,121 @@ import (
 	"car-export-go/internal/service"
 	"car-export-go/internal/storage"
 	"encoding/json"
-	"github.com/streadway/amqp"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
+	"strconv"
+	"time"
 )
 
 func main() {
 	cfg := config.LoadConfig()
+
 	db, err := storage.NewDB(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	repo := repository.NewExportRepository(db)
-	svc := service.NewExportService(repo, cfg.ExportDir)
+	svc := service.NewExportService(repo)
 
-	go startHTTPServer(svc, cfg.ExportDir)
-
-	amqpURL := os.Getenv("RABBITMQ_URL")
-	if amqpURL == "" {
-		amqpURL = "amqp://guest:guest@rabbitmq:5672/"
-	}
-
-	conn, err := amqp.Dial(amqpURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		_ = conn.Close()
-		log.Fatal(err)
-	}
-
-	q, err := ch.QueueDeclare("export_tasks", false, false, false, false, nil)
-	if err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		log.Fatal(err)
-	}
-
-	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
-	if err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		log.Fatal(err)
-	}
-
-	log.Println("Ожидание задач экспорта в RabbitMQ...")
-
-	for d := range msgs {
-		task := string(d.Body)
-		switch task {
-		case "cars":
-			if _, err := svc.ExportCars(); err != nil {
-				log.Printf("ошибка экспорта cars: %v", err)
-			} else {
-				log.Println("Экспорт cars завершён")
-			}
-		case "clients":
-			if _, err := svc.ExportClients(); err != nil {
-				log.Printf("ошибка экспорта clients: %v", err)
-			} else {
-				log.Println("Экспорт clients завершён")
-			}
-		case "rent_histories":
-			if _, err := svc.ExportRentHistories(); err != nil {
-				log.Printf("ошибка экспорта rent_histories: %v", err)
-			} else {
-				log.Println("Экспорт rent_histories завершён")
-			}
-		case "rental_requests":
-			if _, err := svc.ExportRentalRequests(); err != nil {
-				log.Printf("ошибка экспорта rental_requests: %v", err)
-			} else {
-				log.Println("Экспорт rental_requests завершён")
-			}
-		default:
-			log.Printf("Неизвестная задача: %s", task)
-		}
-	}
-
-	_ = ch.Close()
-	_ = conn.Close()
-}
-
-func startHTTPServer(svc *service.ExportService, exportDir string) {
-	http.HandleFunc("/export/cars", func(w http.ResponseWriter, _ *http.Request) {
-		path, err := svc.ExportCars()
-		if err != nil {
-			http.Error(w, "Ошибка экспорта: "+err.Error(), http.StatusInternalServerError)
+	http.HandleFunc("/api/export/rent_histories", func(w http.ResponseWriter, r *http.Request) {
+		from, to, page, perPage, ok := parseParams(w, r)
+		if !ok {
 			return
 		}
-		sendExportResult(w, path)
-	})
 
-	http.HandleFunc("/export/clients", func(w http.ResponseWriter, _ *http.Request) {
-		path, err := svc.ExportClients()
+		rows, total, err := svc.RentHistories(from, to, page, perPage)
 		if err != nil {
-			http.Error(w, "Ошибка экспорта: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "db error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		sendExportResult(w, path)
+
+		writePagedJSON(w, rows, total, from, to, page, perPage)
 	})
 
-	http.HandleFunc("/export/rent_histories", func(w http.ResponseWriter, _ *http.Request) {
-		path, err := svc.ExportRentHistories()
-		if err != nil {
-			http.Error(w, "Ошибка экспорта: "+err.Error(), http.StatusInternalServerError)
+	http.HandleFunc("/api/export/rental_requests", func(w http.ResponseWriter, r *http.Request) {
+		from, to, page, perPage, ok := parseParams(w, r)
+		if !ok {
 			return
 		}
-		sendExportResult(w, path)
-	})
 
-	http.HandleFunc("/export/rental_requests", func(w http.ResponseWriter, _ *http.Request) {
-		path, err := svc.ExportRentalRequests()
+		rows, total, err := svc.RentalRequests(from, to, page, perPage)
 		if err != nil {
-			http.Error(w, "Ошибка экспорта: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "db error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		sendExportResult(w, path)
+
+		writePagedJSON(w, rows, total, from, to, page, perPage)
 	})
 
-	http.HandleFunc("/exports/", func(w http.ResponseWriter, r *http.Request) {
-		fileName := filepath.Base(r.URL.Path)
-		filePath := filepath.Join(exportDir, fileName)
-		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+fileName+"\"")
-		http.ServeFile(w, r, filePath)
-	})
-
-	log.Println("HTTP сервер запущен на :8002")
+	log.Println("Go export service listening on :8002")
 	log.Fatal(http.ListenAndServe(":8002", nil))
 }
 
-func sendExportResult(w http.ResponseWriter, filePath string) {
-	fileName := filepath.Base(filePath)
-	url := "/exports/" + fileName
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":   "done",
-		"file_url": url,
-	}); err != nil {
-		log.Printf("Ошибка при кодировании ответа: %v", err)
+func parseParams(w http.ResponseWriter, r *http.Request) (time.Time, time.Time, int, int, bool) {
+	q := r.URL.Query()
+
+	fromStr := q.Get("from")
+	if fromStr == "" {
+		fromStr = q.Get("date_from")
 	}
+	toStr := q.Get("to")
+	if toStr == "" {
+		toStr = q.Get("date_to")
+	}
+
+	if fromStr == "" || toStr == "" {
+		http.Error(w, "from and to are required (YYYY-MM-DD)", http.StatusBadRequest)
+		return time.Time{}, time.Time{}, 0, 0, false
+	}
+
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		http.Error(w, "invalid from (YYYY-MM-DD)", http.StatusBadRequest)
+		return time.Time{}, time.Time{}, 0, 0, false
+	}
+	to, err := time.Parse("2006-01-02", toStr)
+	if err != nil {
+		http.Error(w, "invalid to (YYYY-MM-DD)", http.StatusBadRequest)
+		return time.Time{}, time.Time{}, 0, 0, false
+	}
+
+	page := atoiOr(q.Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	perPage := atoiOr(q.Get("per_page"), 1000)
+	if perPage < 1 {
+		perPage = 1000
+	}
+
+	return from, to, page, perPage, true
+}
+
+func atoiOr(v string, def int) int {
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
+func writePagedJSON(w http.ResponseWriter, rows any, total int64, from, to time.Time, page, perPage int) {
+	hasMore := int64(page*perPage) < total
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"data": rows,
+		"meta": map[string]any{
+			"from":     from.Format("2006-01-02"),
+			"to":       to.Format("2006-01-02"),
+			"page":     page,
+			"per_page": perPage,
+			"total":    total,
+			"has_more": hasMore,
+		},
+	})
 }
